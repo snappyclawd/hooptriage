@@ -710,7 +710,7 @@ def main():
         description="🏀 HoopTriage — Sort, score, and organise basketball clips fast.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input", help="Folder containing video clips")
+    parser.add_argument("input", nargs="?", default=None, help="Folder containing video clips")
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: <input>/hooptriage_report)")
     parser.add_argument("--min-score", type=int, default=0, help="Only include clips with score >= N in report")
     parser.add_argument("--scan-only", action="store_true", help="Quick scan only — skip audio triage (instant report)")
@@ -718,9 +718,24 @@ def main():
 
     args = parser.parse_args()
 
+    # Interactive mode: prompt for folder if not provided
+    if args.input is None:
+        print("🏀 HoopTriage")
+        print()
+        try:
+            raw = input("Drag a folder here (or paste a path): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nBye! 🏀")
+            sys.exit(0)
+
+        # Clean up path (macOS drag-and-drop adds quotes and escapes spaces)
+        raw = raw.strip("'\"")
+        raw = raw.replace("\\ ", " ")
+        args.input = raw
+
     input_dir = os.path.abspath(args.input)
     if not os.path.isdir(input_dir):
-        print(f"Error: {{input_dir}} is not a directory")
+        print(f"Error: {input_dir} is not a directory")
         sys.exit(1)
 
     output_dir = args.output or os.path.join(input_dir, "hooptriage_report")
@@ -747,6 +762,15 @@ def main():
     report_path = generate_report(results, output_dir, input_dir)
     print(f"   Report ready: {report_path}")
     print(f"   Open it now:  open \"{report_path}\"\n")
+
+    # Auto-open report in browser
+    import platform
+    if platform.system() == "Darwin":
+        subprocess.Popen(["open", report_path])
+    elif platform.system() == "Windows":
+        os.startfile(report_path)
+    else:
+        subprocess.Popen(["xdg-open", report_path], stderr=subprocess.DEVNULL)
 
     if args.scan_only:
         print("Scan complete. Run with --triage-only to add audio scores later.")
