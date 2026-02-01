@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+hooptriage_report/
+*.egg-info/
+dist/
+build/
+.env
