@@ -51,27 +51,40 @@ sudo apt install ffmpeg
 ## Usage
 
 ```bash
-# Basic — analyse a folder of clips
-python hooptriage.py /path/to/clips
+# Full run — scan + triage + report
+python3 hooptriage.py /path/to/clips
+
+# Quick scan — instant report, no audio analysis
+python3 hooptriage.py /path/to/clips --scan-only
 
 # Specify output directory
-python hooptriage.py /path/to/clips --output ./report
-
-# Only show clips scoring 3+
-python hooptriage.py /path/to/clips --min-score 3
-
-# Skip jersey detection (faster)
-python hooptriage.py /path/to/clips --no-teams
+python3 hooptriage.py /path/to/clips --output ./report
 ```
 
-After running, open `report/index.html` in your browser to review your clips.
+After running, open `hooptriage_report/index.html` in your browser.
 
-## How It Works
+## Features
 
-1. **Audio Analysis** — Extracts audio from each clip, measures RMS energy and peak levels. Crowd reactions = high energy = interesting clip.
-2. **Contact Sheets** — Extracts 4 evenly-spaced frames from each clip. Way more useful than a single thumbnail.
-3. **Jersey Detection** — Samples frames and identifies dominant non-court colours to group clips by team.
-4. **HTML Report** — Everything in a fast, sortable, filterable browser interface. Click to play any clip.
+### Hover Scrub
+Move your mouse across any clip to scrub through it. Left edge = start, right edge = end. Just like Resolve's media browser.
+
+### Audio Scoring
+Extracts audio from each clip and scores excitement (1-5) based on crowd noise energy. High energy = crowd reaction = interesting clip.
+
+### Manual Ratings
+Click the stars on any clip to override the auto-score. Hover over a clip and press 1-5 on your keyboard for quick rating. Manual ratings are saved in your browser.
+
+### Grid Size
+Use the slider to adjust how many clips per row — from 1 (full width) to 5 (compact grid).
+
+### Sorting & Filtering
+Sort by score, name, or duration. Filter by score level or show only manually-rated clips.
+
+### Live Updates
+The report opens instantly after a quick scan. Audio triage runs in the background and scores appear as clips are processed — no need to wait.
+
+### Double-Click to Play
+Double-click any clip to expand it with full playback controls and audio.
 
 ## 100% Local
 

@@ -7,12 +7,10 @@ Sort, score, and organise tournament footage fast.
 import argparse
 import json
 import os
-import struct
 import subprocess
 import sys
 import tempfile
 import wave
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -27,8 +25,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".mts", ".webm"}
-CONTACT_SHEET_FRAMES = 4
-FRAME_WIDTH = 480  # px per frame in contact sheet
 
 
 # ---------------------------------------------------------------------------
@@ -45,14 +41,30 @@ def check_ffmpeg():
             sys.exit(1)
 
 
-def get_duration(clip_path: str) -> float:
-    """Return clip duration in seconds."""
+def get_clip_info(clip_path: str) -> dict:
+    """Return clip duration and basic info."""
     result = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", clip_path],
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", clip_path],
         capture_output=True, text=True,
     )
     info = json.loads(result.stdout)
-    return float(info["format"].get("duration", 0))
+    duration = float(info.get("format", {}).get("duration", 0))
+    size_bytes = int(info.get("format", {}).get("size", 0))
+
+    # Get video dimensions
+    width, height = 0, 0
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") == "video":
+            width = stream.get("width", 0)
+            height = stream.get("height", 0)
+            break
+
+    return {
+        "duration": duration,
+        "size_bytes": size_bytes,
+        "width": width,
+        "height": height,
+    }
 
 
 def extract_audio_pcm(clip_path: str, tmp_dir: str) -> str | None:
@@ -71,51 +83,16 @@ def extract_audio_pcm(clip_path: str, tmp_dir: str) -> str | None:
     return out_path
 
 
-def extract_frames(clip_path: str, output_dir: str, num_frames: int = CONTACT_SHEET_FRAMES) -> list[str]:
-    """Extract evenly-spaced frames from a clip. Returns list of frame paths."""
-    duration = get_duration(clip_path)
-    if duration <= 0:
-        return []
-
-    frame_paths = []
-    for i in range(num_frames):
-        # Spread frames across 10%-90% of the clip to avoid black frames
-        t = duration * (0.1 + 0.8 * i / max(num_frames - 1, 1))
-        out_path = os.path.join(output_dir, f"frame_{i:02d}.jpg")
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", clip_path,
-                "-vframes", "1", "-q:v", "3",
-                "-vf", f"scale={FRAME_WIDTH}:-1",
-                out_path,
-            ],
-            capture_output=True,
-        )
-        if os.path.exists(out_path):
-            frame_paths.append(out_path)
-
-    return frame_paths
-
-
-def build_contact_sheet(frame_paths: list[str], output_path: str):
-    """Stitch frames horizontally into a single contact sheet image."""
-    if not frame_paths:
-        return
-    inputs = []
-    for fp in frame_paths:
-        inputs.extend(["-i", fp])
-
-    filter_parts = []
-    for i in range(len(frame_paths)):
-        filter_parts.append(f"[{i}]scale={FRAME_WIDTH}:-1:force_original_aspect_ratio=decrease,pad={FRAME_WIDTH}:ih:(ow-iw)/2[f{i}];")
-
-    hstack = "".join(f"[f{i}]" for i in range(len(frame_paths)))
-    hstack += f"hstack=inputs={len(frame_paths)}"
-
-    filter_str = "".join(filter_parts) + hstack
-
+def extract_poster(clip_path: str, output_path: str, duration: float):
+    """Extract a single poster frame from 25% into the clip."""
+    t = max(duration * 0.25, 0.1)
     subprocess.run(
-        ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_str, "-q:v", "3", output_path],
+        [
+            "ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", clip_path,
+            "-vframes", "1", "-q:v", "4",
+            "-vf", "scale=640:-1",
+            output_path,
+        ],
         capture_output=True,
     )
 
@@ -129,7 +106,7 @@ def analyse_audio(wav_path: str) -> dict:
     with wave.open(wav_path, "rb") as wf:
         n_frames = wf.getnframes()
         if n_frames == 0:
-            return {"rms": 0, "peak": 0, "dynamic_range": 0}
+            return {"rms": 0, "peak": 0, "dynamic_range": 0, "peak_window_rms": 0}
         raw = wf.readframes(n_frames)
 
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
@@ -137,7 +114,6 @@ def analyse_audio(wav_path: str) -> dict:
     rms = float(np.sqrt(np.mean(samples ** 2)))
     peak = float(np.max(np.abs(samples)))
 
-    # Compute RMS in windows to measure dynamic range
     window_size = 1600  # 100ms at 16kHz
     if len(samples) > window_size:
         n_windows = len(samples) // window_size
@@ -159,15 +135,12 @@ def analyse_audio(wav_path: str) -> dict:
 
 def score_excitement(metrics: dict) -> int:
     """Convert audio metrics to a 1-5 excitement score."""
-    # Combine RMS, peak window RMS, and dynamic range
-    # Higher values in all = more exciting (crowd reactions, whistles, cheering)
     combined = (
         metrics.get("peak_window_rms", 0) * 0.5
         + metrics.get("dynamic_range", 0) * 0.3
         + metrics.get("rms", 0) * 0.2
     )
 
-    # Map to 1-5 scale (thresholds tuned for typical basketball gym audio)
     if combined > 0.25:
         return 5
     elif combined > 0.15:
@@ -181,315 +154,542 @@ def score_excitement(metrics: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Jersey / team colour detection
+# Clip discovery
 # ---------------------------------------------------------------------------
 
-def detect_dominant_colours(frame_path: str) -> list[tuple[int, int, int]]:
-    """Detect dominant non-court colours from a frame using simple histogram analysis."""
-    # Extract a small version of the frame as raw RGB
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", frame_path,
-            "-vf", "scale=64:48",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "pipe:1",
-        ],
-        capture_output=True,
-    )
-    if result.returncode != 0 or not result.stdout:
-        return []
-
-    pixels = np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, 3)
-
-    # Filter out court-like colours (browns, tans, greys)
-    # Keep saturated colours that are likely jerseys
-    # Convert to simple saturation metric
-    max_c = pixels.max(axis=1).astype(np.float64)
-    min_c = pixels.min(axis=1).astype(np.float64)
-    saturation = np.where(max_c > 0, (max_c - min_c) / max_c, 0)
-
-    # Keep pixels with decent saturation (coloured jerseys)
-    mask = saturation > 0.3
-    coloured = pixels[mask]
-
-    if len(coloured) < 10:
-        return []
-
-    # Simple quantisation: reduce to 8 levels per channel
-    quantised = (coloured // 32) * 32 + 16
-
-    # Find most common colours
-    unique, counts = np.unique(quantised, axis=0, return_counts=True)
-    top_idx = np.argsort(counts)[::-1][:3]
-
-    return [tuple(int(c) for c in unique[i]) for i in top_idx]
-
-
-def colour_name(rgb: tuple[int, int, int]) -> str:
-    """Convert RGB to a rough colour name."""
-    r, g, b = rgb
-    if r > 180 and g < 100 and b < 100:
-        return "red"
-    if r < 100 and g > 150 and b < 100:
-        return "green"
-    if r < 100 and g < 100 and b > 150:
-        return "blue"
-    if r > 180 and g > 180 and b < 100:
-        return "yellow"
-    if r > 180 and g > 100 and b < 80:
-        return "orange"
-    if r > 100 and g < 80 and b > 150:
-        return "purple"
-    if r > 200 and g > 200 and b > 200:
-        return "white"
-    if r < 60 and g < 60 and b < 60:
-        return "black"
-    if r > 150 and g > 150 and b > 150:
-        return "grey"
-    return f"rgb({r},{g},{b})"
-
-
-def detect_team_colour(clip_path: str, tmp_dir: str) -> str | None:
-    """Detect the dominant jersey colour from a clip's middle frame."""
-    duration = get_duration(clip_path)
-    if duration <= 0:
-        return None
-
-    mid_frame = os.path.join(tmp_dir, "team_frame.jpg")
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-ss", f"{duration * 0.5:.2f}", "-i", clip_path,
-            "-vframes", "1", "-q:v", "5", "-vf", "scale=320:-1", mid_frame,
-        ],
-        capture_output=True,
-    )
-
-    if not os.path.exists(mid_frame):
-        return None
-
-    colours = detect_dominant_colours(mid_frame)
-    if colours:
-        return colour_name(colours[0])
-    return None
+def find_clips(input_dir: str) -> list[str]:
+    """Find all supported video clips in directory (recursive)."""
+    clips = []
+    for root, _, files in os.walk(input_dir):
+        for f in sorted(files):
+            if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS and not f.startswith("."):
+                clips.append(os.path.join(root, f))
+    return clips
 
 
 # ---------------------------------------------------------------------------
-# Process a single clip
+# Phase 1: Quick scan — generate HTML immediately
 # ---------------------------------------------------------------------------
 
-def process_clip(clip_path: str, output_dir: str, detect_teams: bool = True) -> dict:
-    """Process a single clip: audio analysis, contact sheet, optional team detection."""
-    clip_name = os.path.basename(clip_path)
-    clip_stem = Path(clip_path).stem
-    clip_output_dir = os.path.join(output_dir, "clips", clip_stem)
-    os.makedirs(clip_output_dir, exist_ok=True)
+def quick_scan(clips: list[str]) -> list[dict]:
+    """Quick scan: just get durations and paths. No heavy processing."""
+    results = []
+    for i, clip_path in enumerate(clips, 1):
+        clip_name = os.path.basename(clip_path)
+        print(f"  Scanning [{i}/{len(clips)}] {clip_name}", end="\r", flush=True)
 
-    result = {
-        "filename": clip_name,
-        "path": os.path.abspath(clip_path),
-        "duration": 0,
-        "score": 1,
-        "audio_metrics": {},
-        "team_colour": None,
-        "contact_sheet": None,
-    }
+        try:
+            info = get_clip_info(clip_path)
+        except Exception:
+            info = {"duration": 0, "size_bytes": 0, "width": 0, "height": 0}
 
-    try:
-        result["duration"] = get_duration(clip_path)
-    except Exception:
-        return result
+        results.append({
+            "filename": clip_name,
+            "path": os.path.abspath(clip_path),
+            "duration": info["duration"],
+            "size_bytes": info["size_bytes"],
+            "width": info["width"],
+            "height": info["height"],
+            "score": 0,  # 0 = not yet analysed
+            "audio_metrics": {},
+            "poster": None,
+        })
 
-    # Audio analysis
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        wav_path = extract_audio_pcm(clip_path, tmp_dir)
-        if wav_path:
-            metrics = analyse_audio(wav_path)
-            result["audio_metrics"] = metrics
-            result["score"] = score_excitement(metrics)
+    print(f"  Scanned {len(clips)} clips.{' ' * 30}")
+    return results
 
-        # Team colour detection
-        if detect_teams:
-            result["team_colour"] = detect_team_colour(clip_path, tmp_dir)
 
-    # Contact sheet
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        frames = extract_frames(clip_path, tmp_dir)
-        if frames:
-            sheet_path = os.path.join(clip_output_dir, "contact_sheet.jpg")
-            build_contact_sheet(frames, sheet_path)
-            if os.path.exists(sheet_path):
-                result["contact_sheet"] = os.path.relpath(sheet_path, output_dir)
+# ---------------------------------------------------------------------------
+# Phase 2: Audio triage
+# ---------------------------------------------------------------------------
 
-    return result
+def run_triage(clips: list[dict], output_dir: str):
+    """Run audio analysis on all clips and update scores."""
+    data_path = os.path.join(output_dir, "triage_data.json")
+
+    for i, clip in enumerate(clips, 1):
+        clip_name = clip["filename"]
+        print(f"  [{i}/{len(clips)}] {clip_name}", end="", flush=True)
+
+        # Audio analysis
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wav_path = extract_audio_pcm(clip["path"], tmp_dir)
+            if wav_path:
+                metrics = analyse_audio(wav_path)
+                clip["audio_metrics"] = metrics
+                clip["score"] = score_excitement(metrics)
+            else:
+                clip["score"] = 1
+
+        # Extract poster frame
+        poster_dir = os.path.join(output_dir, "posters")
+        os.makedirs(poster_dir, exist_ok=True)
+        poster_path = os.path.join(poster_dir, f"{Path(clip_name).stem}.jpg")
+        extract_poster(clip["path"], poster_path, clip["duration"])
+        if os.path.exists(poster_path):
+            clip["poster"] = os.path.relpath(poster_path, output_dir)
+
+        stars = "★" * clip["score"] + "☆" * (5 - clip["score"])
+        print(f"  →  {stars}")
+
+        # Write progress to JSON after each clip
+        with open(data_path, "w") as f:
+            json.dump(clips, f, indent=2)
+
+    return clips
 
 
 # ---------------------------------------------------------------------------
 # HTML report generation
 # ---------------------------------------------------------------------------
 
-def generate_report(clips: list[dict], output_dir: str):
-    """Generate an HTML report for reviewing clips."""
-    clips_sorted = sorted(clips, key=lambda c: c["score"], reverse=True)
+def generate_report(clips: list[dict], output_dir: str, input_dir: str) -> str:
+    """Generate the HTML report with hover-scrub, manual ratings, and grid controls."""
 
-    # Collect unique team colours
-    team_colours = sorted(set(c["team_colour"] for c in clips if c["team_colour"]))
-
-    score_colours = {
-        5: "#22c55e",  # green
-        4: "#84cc16",  # lime
-        3: "#eab308",  # yellow
-        2: "#f97316",  # orange
-        1: "#ef4444",  # red
-    }
+    clips_json = json.dumps(clips, indent=2)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>HoopTriage Report — {len(clips)} clips</title>
+<title>🏀 HoopTriage — {len(clips)} clips</title>
 <style>
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px; }}
-    h1 {{ font-size: 28px; margin-bottom: 8px; }}
-    .subtitle {{ color: #94a3b8; margin-bottom: 24px; font-size: 14px; }}
-    .filters {{ display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; align-items: center; }}
-    .filter-btn {{ padding: 6px 16px; border-radius: 20px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; cursor: pointer; font-size: 13px; transition: all 0.15s; }}
-    .filter-btn:hover {{ background: #334155; }}
-    .filter-btn.active {{ background: #3b82f6; border-color: #3b82f6; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(500px, 1fr)); gap: 16px; }}
-    .clip {{ background: #1e293b; border-radius: 12px; overflow: hidden; transition: transform 0.15s; }}
-    .clip:hover {{ transform: translateY(-2px); }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }}
+
+    /* Top bar */
+    .topbar {{ position: sticky; top: 0; z-index: 100; background: #0f172aee; backdrop-filter: blur(12px); border-bottom: 1px solid #1e293b; padding: 12px 24px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
+    .topbar h1 {{ font-size: 20px; white-space: nowrap; }}
+    .stats {{ display: flex; gap: 16px; font-size: 13px; color: #94a3b8; }}
+    .stats span {{ white-space: nowrap; }}
+    .stats .num {{ color: #e2e8f0; font-weight: 600; }}
+
+    /* Controls */
+    .controls {{ display: flex; gap: 8px; align-items: center; margin-left: auto; flex-wrap: wrap; }}
+    .btn {{ padding: 5px 14px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; cursor: pointer; font-size: 12px; transition: all 0.15s; white-space: nowrap; }}
+    .btn:hover {{ background: #334155; }}
+    .btn.active {{ background: #3b82f6; border-color: #3b82f6; }}
+    .size-slider {{ width: 100px; accent-color: #3b82f6; }}
+    .sort-select {{ background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 5px 8px; font-size: 12px; }}
+
+    /* Filter bar */
+    .filterbar {{ position: sticky; top: 56px; z-index: 99; background: #0f172add; backdrop-filter: blur(12px); padding: 8px 24px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #1e293b; }}
+    .filter-label {{ font-size: 12px; color: #64748b; margin-right: 4px; }}
+
+    /* Grid */
+    .grid-container {{ padding: 16px 24px; }}
+    .grid {{ display: grid; gap: 12px; }}
+
+    /* Clip card */
+    .clip {{ background: #1e293b; border-radius: 10px; overflow: hidden; transition: transform 0.1s; position: relative; }}
+    .clip:hover {{ transform: scale(1.01); }}
     .clip.hidden {{ display: none; }}
-    .contact-sheet {{ width: 100%; display: block; }}
-    .contact-sheet img {{ width: 100%; display: block; }}
-    .clip-info {{ padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }}
-    .clip-name {{ font-size: 13px; font-weight: 500; word-break: break-all; flex: 1; margin-right: 12px; }}
-    .clip-meta {{ display: flex; gap: 8px; align-items: center; flex-shrink: 0; }}
-    .score-badge {{ display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; font-weight: 700; font-size: 16px; color: #0f172a; }}
-    .duration {{ font-size: 12px; color: #94a3b8; }}
-    .team-dot {{ width: 14px; height: 14px; border-radius: 50%; border: 2px solid #334155; flex-shrink: 0; }}
-    .stars {{ font-size: 14px; letter-spacing: 1px; }}
-    .no-sheet {{ padding: 40px; text-align: center; color: #475569; font-size: 13px; background: #0f172a; }}
-    video {{ width: 100%; max-height: 360px; background: #000; }}
-    .play-btn {{ font-size: 12px; padding: 4px 12px; border-radius: 6px; background: #334155; color: #e2e8f0; border: none; cursor: pointer; }}
-    .play-btn:hover {{ background: #475569; }}
-    .summary {{ display: flex; gap: 24px; margin-bottom: 24px; flex-wrap: wrap; }}
-    .stat {{ background: #1e293b; padding: 16px 20px; border-radius: 10px; }}
-    .stat-value {{ font-size: 24px; font-weight: 700; }}
-    .stat-label {{ font-size: 12px; color: #94a3b8; margin-top: 2px; }}
+
+    /* Video container with hover scrub */
+    .vid-wrap {{ position: relative; width: 100%; aspect-ratio: 16/9; background: #000; cursor: crosshair; overflow: hidden; }}
+    .vid-wrap video {{ width: 100%; height: 100%; object-fit: cover; pointer-events: none; }}
+    .vid-wrap img.poster {{ width: 100%; height: 100%; object-fit: cover; position: absolute; top: 0; left: 0; }}
+    .scrub-bar {{ position: absolute; bottom: 0; left: 0; height: 3px; background: #3b82f6; transition: width 0.05s; pointer-events: none; }}
+    .time-indicator {{ position: absolute; bottom: 8px; right: 8px; background: #000a; color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 4px; pointer-events: none; opacity: 0; transition: opacity 0.15s; font-variant-numeric: tabular-nums; }}
+    .vid-wrap:hover .time-indicator {{ opacity: 1; }}
+
+    /* Triage badge */
+    .triage-status {{ position: absolute; top: 8px; left: 8px; font-size: 10px; padding: 2px 8px; border-radius: 4px; background: #334155; color: #94a3b8; pointer-events: none; }}
+    .triage-status.done {{ background: transparent; color: transparent; }}
+
+    /* Clip info */
+    .clip-info {{ padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
+    .clip-name {{ font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }}
+    .clip-meta {{ display: flex; gap: 6px; align-items: center; flex-shrink: 0; }}
+    .duration {{ font-size: 11px; color: #64748b; font-variant-numeric: tabular-nums; }}
+
+    /* Star rating - clickable */
+    .stars {{ display: inline-flex; gap: 1px; cursor: pointer; }}
+    .stars .star {{ font-size: 16px; color: #334155; transition: color 0.1s; user-select: none; }}
+    .stars .star.filled {{ color: #eab308; }}
+    .stars .star:hover {{ color: #facc15; }}
+    .stars.manual .star.filled {{ color: #22d3ee; }}
+
+    /* Score badge */
+    .score-badge {{ min-width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 6px; font-weight: 700; font-size: 13px; color: #0f172a; }}
+    .score-badge.pending {{ background: #334155; color: #64748b; font-size: 10px; }}
+
+    /* Expand to play */
+    .expanded .vid-wrap {{ aspect-ratio: auto; }}
+    .expanded video {{ pointer-events: auto; }}
+
+    /* Score colours */
+    .score-5 {{ background: #22c55e; }}
+    .score-4 {{ background: #84cc16; }}
+    .score-3 {{ background: #eab308; }}
+    .score-2 {{ background: #f97316; }}
+    .score-1 {{ background: #ef4444; }}
+    .score-0 {{ background: #334155; color: #64748b; }}
 </style>
 </head>
 <body>
-<h1>🏀 HoopTriage Report</h1>
-<p class="subtitle">{len(clips)} clips analysed</p>
 
-<div class="summary">
-    <div class="stat">
-        <div class="stat-value">{len(clips)}</div>
-        <div class="stat-label">Total clips</div>
+<div class="topbar">
+    <h1>🏀 HoopTriage</h1>
+    <div class="stats">
+        <span><span class="num" id="stat-total">{len(clips)}</span> clips</span>
+        <span><span class="num" id="stat-hot">-</span> hot</span>
+        <span><span class="num" id="stat-skip">-</span> skip</span>
+        <span><span class="num" id="stat-duration">{sum(c['duration'] for c in clips) / 60:.0f}m</span> footage</span>
+        <span id="triage-progress"></span>
     </div>
-    <div class="stat">
-        <div class="stat-value">{len([c for c in clips if c['score'] >= 4])}</div>
-        <div class="stat-label">Hot clips (4-5)</div>
-    </div>
-    <div class="stat">
-        <div class="stat-value">{len([c for c in clips if c['score'] <= 2])}</div>
-        <div class="stat-label">Likely skip (1-2)</div>
-    </div>
-    <div class="stat">
-        <div class="stat-value">{sum(c['duration'] for c in clips) / 60:.0f}m</div>
-        <div class="stat-label">Total footage</div>
+    <div class="controls">
+        <label style="font-size:12px;color:#64748b;">Grid:</label>
+        <input type="range" class="size-slider" min="1" max="5" value="3" id="grid-size">
+        <select class="sort-select" id="sort-by">
+            <option value="score-desc">Score ↓</option>
+            <option value="score-asc">Score ↑</option>
+            <option value="name-asc">Name A-Z</option>
+            <option value="name-desc">Name Z-A</option>
+            <option value="duration-desc">Longest</option>
+            <option value="duration-asc">Shortest</option>
+        </select>
     </div>
 </div>
 
-<div class="filters">
-    <span style="color:#94a3b8;font-size:13px;">Score:</span>
-    <button class="filter-btn active" onclick="filterScore(0)">All</button>
-    {"".join(f'<button class="filter-btn" onclick="filterScore({s})" style="border-color:{score_colours[s]}50">{s}★</button>' for s in [5,4,3,2,1])}
-    {"".join(f'''
-    <span style="color:#94a3b8;font-size:13px;margin-left:12px;">Team:</span>
-    <button class="filter-btn active" onclick="filterTeam(null)">All</button>
-    ''' + "".join(f'<button class="filter-btn" onclick="filterTeam(&apos;{tc}&apos;)"><span class="team-dot" style="background:{tc};display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;"></span>{tc}</button>' for tc in team_colours)) if team_colours else ""}
+<div class="filterbar">
+    <span class="filter-label">Score:</span>
+    <button class="btn active" data-filter-score="all">All</button>
+    <button class="btn" data-filter-score="5">5★</button>
+    <button class="btn" data-filter-score="4">4★</button>
+    <button class="btn" data-filter-score="3">3★</button>
+    <button class="btn" data-filter-score="2">2★</button>
+    <button class="btn" data-filter-score="1">1★</button>
+    <button class="btn" data-filter-score="0" style="margin-left:4px">⏳ Pending</button>
+    <span class="filter-label" style="margin-left:12px;">Show:</span>
+    <button class="btn active" data-filter-type="all">All</button>
+    <button class="btn" data-filter-type="manual">✋ Manually rated</button>
 </div>
 
-<div class="grid" id="clip-grid">
-"""
-
-    for clip in clips_sorted:
-        score = clip["score"]
-        score_bg = score_colours.get(score, "#64748b")
-        stars = "★" * score + "☆" * (5 - score)
-        duration_str = f"{clip['duration']:.1f}s"
-        team_attr = f'data-team="{clip["team_colour"]}"' if clip["team_colour"] else 'data-team=""'
-        team_dot = f'<span class="team-dot" style="background:{clip["team_colour"]}"></span>' if clip["team_colour"] else ""
-
-        if clip["contact_sheet"]:
-            sheet_html = f'<div class="contact-sheet"><img src="{clip["contact_sheet"]}" loading="lazy" alt="{clip["filename"]}"></div>'
-        else:
-            sheet_html = '<div class="no-sheet">No frames extracted</div>'
-
-        html += f"""
-    <div class="clip" data-score="{score}" {team_attr}>
-        {sheet_html}
-        <div class="clip-info">
-            <span class="clip-name">{clip["filename"]}</span>
-            <div class="clip-meta">
-                {team_dot}
-                <span class="duration">{duration_str}</span>
-                <span class="stars" style="color:{score_bg}">{stars}</span>
-                <span class="score-badge" style="background:{score_bg}">{score}</span>
-                <button class="play-btn" onclick="playClip(this, '{clip['path']}')">▶ Play</button>
-            </div>
-        </div>
-    </div>
-"""
-
-    html += """
+<div class="grid-container">
+    <div class="grid" id="clip-grid"></div>
 </div>
 
 <script>
-let currentScoreFilter = 0;
-let currentTeamFilter = null;
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+const CLIPS = {clips_json};
+const manualRatings = JSON.parse(localStorage.getItem('hooptriage_ratings') || '{{}}');
 
-function filterScore(score) {
-    currentScoreFilter = score;
-    applyFilters();
-    document.querySelectorAll('.filters .filter-btn').forEach(b => {
-        if (b.onclick?.toString().includes('filterScore'))
-            b.classList.toggle('active', b.textContent.includes(score ? score + '★' : 'All'));
-    });
-}
+// Apply any saved manual ratings
+CLIPS.forEach(c => {{
+    if (manualRatings[c.filename] !== undefined) {{
+        c.score = manualRatings[c.filename];
+        c.manual = true;
+    }}
+}});
 
-function filterTeam(team) {
-    currentTeamFilter = team;
-    applyFilters();
-}
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let filterScore = 'all';
+let filterType = 'all';
 
-function applyFilters() {
-    document.querySelectorAll('.clip').forEach(el => {
-        const scoreMatch = !currentScoreFilter || el.dataset.score == currentScoreFilter;
-        const teamMatch = !currentTeamFilter || el.dataset.team === currentTeamFilter;
-        el.classList.toggle('hidden', !(scoreMatch && teamMatch));
-    });
-}
+// ---------------------------------------------------------------------------
+// Grid sizing
+// ---------------------------------------------------------------------------
+const gridSizes = {{ 1: '1fr', 2: 'repeat(2, 1fr)', 3: 'repeat(3, 1fr)', 4: 'repeat(4, 1fr)', 5: 'repeat(5, 1fr)' }};
+const gridEl = document.getElementById('clip-grid');
+const sizeSlider = document.getElementById('grid-size');
 
-function playClip(btn, path) {
-    const clipEl = btn.closest('.clip');
-    let video = clipEl.querySelector('video');
-    if (video) {
-        video.remove();
-        btn.textContent = '▶ Play';
-        return;
-    }
-    video = document.createElement('video');
-    video.src = 'file://' + path;
-    video.controls = true;
-    video.autoplay = true;
-    video.style.width = '100%';
-    clipEl.insertBefore(video, clipEl.querySelector('.clip-info'));
-    btn.textContent = '✕ Close';
-}
+sizeSlider.addEventListener('input', () => {{
+    gridEl.style.gridTemplateColumns = gridSizes[sizeSlider.value];
+}});
+gridEl.style.gridTemplateColumns = gridSizes[sizeSlider.value];
+
+// ---------------------------------------------------------------------------
+// Render clips
+// ---------------------------------------------------------------------------
+function renderClips() {{
+    gridEl.innerHTML = '';
+
+    // Sort
+    const sortBy = document.getElementById('sort-by').value;
+    const sorted = [...CLIPS].sort((a, b) => {{
+        switch(sortBy) {{
+            case 'score-desc': return (b.score || 0) - (a.score || 0);
+            case 'score-asc': return (a.score || 0) - (b.score || 0);
+            case 'name-asc': return a.filename.localeCompare(b.filename);
+            case 'name-desc': return b.filename.localeCompare(a.filename);
+            case 'duration-desc': return b.duration - a.duration;
+            case 'duration-asc': return a.duration - b.duration;
+        }}
+    }});
+
+    sorted.forEach((clip, idx) => {{
+        // Filter
+        if (filterScore !== 'all' && String(clip.score) !== filterScore) return;
+        if (filterType === 'manual' && !clip.manual) return;
+
+        const card = document.createElement('div');
+        card.className = 'clip';
+        card.dataset.idx = idx;
+        card.dataset.filename = clip.filename;
+
+        const scoreClass = clip.score > 0 ? `score-${{clip.score}}` : 'score-0';
+        const stars = renderStars(clip.score, clip.manual);
+        const dur = formatDuration(clip.duration);
+        const triageLabel = clip.score === 0 ? '<span class="triage-status">⏳ pending</span>' : '<span class="triage-status done"></span>';
+        const posterSrc = clip.poster ? clip.poster : '';
+        const posterImg = posterSrc ? `<img class="poster" src="${{posterSrc}}" alt="">` : '';
+
+        card.innerHTML = `
+            <div class="vid-wrap" data-path="${{clip.path}}" data-duration="${{clip.duration}}">
+                ${{posterImg}}
+                <div class="scrub-bar"></div>
+                <div class="time-indicator">0:00</div>
+                ${{triageLabel}}
+            </div>
+            <div class="clip-info">
+                <span class="clip-name" title="${{clip.filename}}">${{clip.filename}}</span>
+                <div class="clip-meta">
+                    <span class="duration">${{dur}}</span>
+                    <span class="stars ${{clip.manual ? 'manual' : ''}}" data-filename="${{clip.filename}}">${{stars}}</span>
+                    <span class="score-badge ${{scoreClass}}">${{clip.score || '?'}}</span>
+                </div>
+            </div>
+        `;
+
+        gridEl.appendChild(card);
+    }});
+
+    // Attach events
+    attachScrubEvents();
+    attachStarEvents();
+    updateStats();
+}}
+
+function renderStars(score, manual) {{
+    let html = '';
+    for (let i = 1; i <= 5; i++) {{
+        html += `<span class="star ${{i <= score ? 'filled' : ''}}" data-value="${{i}}">★</span>`;
+    }}
+    return html;
+}}
+
+function formatDuration(secs) {{
+    if (secs < 60) return `${{secs.toFixed(1)}}s`;
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${{m}}:${{String(s).padStart(2, '0')}}`;
+}}
+
+function updateStats() {{
+    const scored = CLIPS.filter(c => c.score > 0);
+    document.getElementById('stat-hot').textContent = scored.filter(c => c.score >= 4).length || '-';
+    document.getElementById('stat-skip').textContent = scored.filter(c => c.score <= 2).length || '-';
+
+    const pending = CLIPS.filter(c => c.score === 0).length;
+    const prog = document.getElementById('triage-progress');
+    if (pending > 0) {{
+        prog.innerHTML = `<span style="color:#eab308">⏳ ${{CLIPS.length - pending}}/${{CLIPS.length}} triaged</span>`;
+    }} else {{
+        prog.innerHTML = '<span style="color:#22c55e">✓ All triaged</span>';
+    }}
+}}
+
+// ---------------------------------------------------------------------------
+// Hover scrub
+// ---------------------------------------------------------------------------
+function attachScrubEvents() {{
+    document.querySelectorAll('.vid-wrap').forEach(wrap => {{
+        let video = null;
+        let isLoaded = false;
+
+        wrap.addEventListener('mouseenter', () => {{
+            if (wrap.closest('.expanded')) return;
+            if (!video) {{
+                video = document.createElement('video');
+                video.src = 'file://' + wrap.dataset.path;
+                video.muted = true;
+                video.preload = 'auto';
+                video.playsInline = true;
+                video.style.cssText = 'width:100%;height:100%;object-fit:cover;pointer-events:none;';
+                wrap.insertBefore(video, wrap.firstChild);
+
+                video.addEventListener('loadeddata', () => {{
+                    isLoaded = true;
+                    const poster = wrap.querySelector('.poster');
+                    if (poster) poster.style.opacity = '0';
+                }});
+            }}
+        }});
+
+        wrap.addEventListener('mousemove', (e) => {{
+            if (!video || !isLoaded || wrap.closest('.expanded')) return;
+            const rect = wrap.getBoundingClientRect();
+            const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            const duration = parseFloat(wrap.dataset.duration) || 0;
+            const time = pct * duration;
+
+            video.currentTime = time;
+
+            // Update scrub bar
+            wrap.querySelector('.scrub-bar').style.width = (pct * 100) + '%';
+
+            // Update time indicator
+            const mins = Math.floor(time / 60);
+            const secs = Math.floor(time % 60);
+            wrap.querySelector('.time-indicator').textContent = `${{mins}}:${{String(secs).padStart(2, '0')}}`;
+        }});
+
+        wrap.addEventListener('mouseleave', () => {{
+            if (wrap.closest('.expanded')) return;
+            wrap.querySelector('.scrub-bar').style.width = '0';
+            const poster = wrap.querySelector('.poster');
+            if (poster) poster.style.opacity = '1';
+        }});
+
+        // Double-click to expand and play with controls
+        wrap.addEventListener('dblclick', () => {{
+            const card = wrap.closest('.clip');
+            if (card.classList.contains('expanded')) {{
+                card.classList.remove('expanded');
+                if (video) {{
+                    video.controls = false;
+                    video.muted = true;
+                    video.pause();
+                    video.style.pointerEvents = 'none';
+                }}
+            }} else {{
+                card.classList.add('expanded');
+                if (video) {{
+                    video.controls = true;
+                    video.muted = false;
+                    video.style.pointerEvents = 'auto';
+                    video.play();
+                }}
+            }}
+        }});
+    }});
+}}
+
+// ---------------------------------------------------------------------------
+// Clickable star ratings
+// ---------------------------------------------------------------------------
+function attachStarEvents() {{
+    document.querySelectorAll('.stars').forEach(starsEl => {{
+        starsEl.querySelectorAll('.star').forEach(star => {{
+            star.addEventListener('click', (e) => {{
+                e.stopPropagation();
+                const filename = starsEl.dataset.filename;
+                const value = parseInt(star.dataset.value);
+
+                // Update data
+                const clip = CLIPS.find(c => c.filename === filename);
+                if (clip) {{
+                    clip.score = value;
+                    clip.manual = true;
+                }}
+
+                // Save to localStorage
+                manualRatings[filename] = value;
+                localStorage.setItem('hooptriage_ratings', JSON.stringify(manualRatings));
+
+                // Update UI
+                starsEl.classList.add('manual');
+                starsEl.querySelectorAll('.star').forEach(s => {{
+                    s.classList.toggle('filled', parseInt(s.dataset.value) <= value);
+                }});
+
+                // Update score badge
+                const badge = starsEl.closest('.clip-meta').querySelector('.score-badge');
+                badge.textContent = value;
+                badge.className = `score-badge score-${{value}}`;
+
+                updateStats();
+            }});
+        }});
+    }});
+}}
+
+// ---------------------------------------------------------------------------
+// Filter buttons
+// ---------------------------------------------------------------------------
+document.querySelectorAll('[data-filter-score]').forEach(btn => {{
+    btn.addEventListener('click', () => {{
+        filterScore = btn.dataset.filterScore;
+        document.querySelectorAll('[data-filter-score]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderClips();
+    }});
+}});
+
+document.querySelectorAll('[data-filter-type]').forEach(btn => {{
+    btn.addEventListener('click', () => {{
+        filterType = btn.dataset.filterType;
+        document.querySelectorAll('[data-filter-type]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderClips();
+    }});
+}});
+
+document.getElementById('sort-by').addEventListener('change', renderClips);
+
+// ---------------------------------------------------------------------------
+// Polling for triage updates
+// ---------------------------------------------------------------------------
+let pollInterval = null;
+
+function pollTriageData() {{
+    fetch('triage_data.json?t=' + Date.now())
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {{
+            if (!data) return;
+            let changed = false;
+            data.forEach(d => {{
+                const clip = CLIPS.find(c => c.filename === d.filename);
+                if (clip && !clip.manual && d.score > 0 && clip.score === 0) {{
+                    clip.score = d.score;
+                    clip.audio_metrics = d.audio_metrics;
+                    clip.poster = d.poster;
+                    changed = true;
+                }}
+            }});
+            if (changed) renderClips();
+
+            // Stop polling when all done
+            if (CLIPS.every(c => c.score > 0)) {{
+                clearInterval(pollInterval);
+                document.getElementById('triage-progress').innerHTML = '<span style="color:#22c55e">✓ All triaged</span>';
+            }}
+        }})
+        .catch(() => {{}});
+}}
+
+// Start polling if there are pending clips
+if (CLIPS.some(c => c.score === 0)) {{
+    pollInterval = setInterval(pollTriageData, 2000);
+}}
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts
+// ---------------------------------------------------------------------------
+document.addEventListener('keydown', (e) => {{
+    // 1-5: rate focused/hovered clip
+    if (e.key >= '1' && e.key <= '5') {{
+        const hovered = document.querySelector('.clip:hover');
+        if (hovered) {{
+            const starsEl = hovered.querySelector('.stars');
+            if (starsEl) {{
+                const star = starsEl.querySelector(`[data-value="${{e.key}}"]`);
+                if (star) star.click();
+            }}
+        }}
+    }}
+}});
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+renderClips();
 </script>
 </body>
 </html>"""
@@ -505,16 +705,6 @@ function playClip(btn, path) {
 # Main
 # ---------------------------------------------------------------------------
 
-def find_clips(input_dir: str) -> list[str]:
-    """Find all supported video clips in directory (recursive)."""
-    clips = []
-    for root, _, files in os.walk(input_dir):
-        for f in sorted(files):
-            if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS and not f.startswith("."):
-                clips.append(os.path.join(root, f))
-    return clips
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="🏀 HoopTriage — Sort, score, and organise basketball clips fast.",
@@ -523,14 +713,14 @@ def main():
     parser.add_argument("input", help="Folder containing video clips")
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: <input>/hooptriage_report)")
     parser.add_argument("--min-score", type=int, default=0, help="Only include clips with score >= N in report")
-    parser.add_argument("--no-teams", action="store_true", help="Skip jersey colour detection (faster)")
-    parser.add_argument("--workers", "-w", type=int, default=4, help="Parallel workers (default: 4)")
+    parser.add_argument("--scan-only", action="store_true", help="Quick scan only — skip audio triage (instant report)")
+    parser.add_argument("--triage-only", action="store_true", help="Run triage on already-scanned clips")
 
     args = parser.parse_args()
 
     input_dir = os.path.abspath(args.input)
     if not os.path.isdir(input_dir):
-        print(f"Error: {input_dir} is not a directory")
+        print(f"Error: {{input_dir}} is not a directory")
         sys.exit(1)
 
     output_dir = args.output or os.path.join(input_dir, "hooptriage_report")
@@ -548,44 +738,38 @@ def main():
         print("No video clips found. Supported formats: " + ", ".join(sorted(SUPPORTED_EXTENSIONS)))
         sys.exit(1)
 
-    print(f"Found {len(clips)} clips. Analysing...\n")
+    # Phase 1: Quick scan
+    print(f"Phase 1: Scanning {len(clips)} clips...")
+    results = quick_scan(clips)
 
-    results = []
-    detect_teams = not args.no_teams
-
-    # Process clips (sequential for now — ffmpeg is already parallel-ish internally)
-    for i, clip_path in enumerate(clips, 1):
-        clip_name = os.path.basename(clip_path)
-        print(f"  [{i}/{len(clips)}] {clip_name}", end="", flush=True)
-
-        result = process_clip(clip_path, output_dir, detect_teams)
-
-        stars = "★" * result["score"] + "☆" * (5 - result["score"])
-        team_str = f" [{result['team_colour']}]" if result["team_colour"] else ""
-        print(f"  →  {stars}{team_str}")
-
-        results.append(result)
-
-    # Filter by min score
-    if args.min_score > 0:
-        results = [r for r in results if r["score"] >= args.min_score]
-        print(f"\nFiltered to {len(results)} clips with score >= {args.min_score}")
-
-    # Generate report
+    # Generate report immediately (browsable before triage finishes)
     print(f"\nGenerating report...")
-    report_path = generate_report(results, output_dir)
+    report_path = generate_report(results, output_dir, input_dir)
+    print(f"   Report ready: {report_path}")
+    print(f"   Open it now:  open \"{report_path}\"\n")
+
+    if args.scan_only:
+        print("Scan complete. Run with --triage-only to add audio scores later.")
+        return
+
+    # Phase 2: Audio triage
+    print(f"Phase 2: Audio triage (scores will update in the report as they complete)...")
+    results = run_triage(results, output_dir)
+
+    # Regenerate final report with all scores
+    generate_report(results, output_dir, input_dir)
 
     # Summary
-    scores = [r["score"] for r in results]
+    scores = [r["score"] for r in results if r["score"] > 0]
     print(f"\n{'='*50}")
     print(f"🏀 HoopTriage Complete!")
     print(f"{'='*50}")
     print(f"   Clips analysed:  {len(results)}")
     print(f"   Hot clips (4-5): {len([s for s in scores if s >= 4])}")
     print(f"   Medium (3):      {len([s for s in scores if s == 3])}")
-    print(f"   Likely skip (≤2):{len([s for s in scores if s <= 2])}")
+    print(f"   Likely skip (≤2): {len([s for s in scores if s <= 2])}")
     print(f"\n   Report: {report_path}")
-    print(f"\n   Open it:  open \"{report_path}\"")
+    print(f"   Open it:  open \"{report_path}\"")
 
 
 if __name__ == "__main__":
