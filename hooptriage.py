@@ -5,6 +5,7 @@ Sort, score, and organise tournament footage fast.
 """
 
 import argparse
+import glob
 import json
 import os
 import subprocess
@@ -25,6 +26,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".mts", ".webm"}
+SCRUB_FRAMES = 24  # Number of frames in sprite sheet
+SPRITE_FRAME_HEIGHT = 135  # Height per frame in sprite sheet (240px wide, 16:9)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +98,68 @@ def extract_poster(clip_path: str, output_path: str, duration: float):
         ],
         capture_output=True,
     )
+
+
+def generate_sprite_sheet(clip_path: str, output_path: str, duration: float, num_frames: int = SCRUB_FRAMES) -> dict | None:
+    """Generate a vertical sprite sheet of evenly-spaced frames for hover scrubbing."""
+    if duration <= 0:
+        return None
+
+    frame_width = 320
+    frame_height = 180  # 16:9 aspect
+
+    fps = num_frames / duration
+
+    # Extract individual frames then tile them vertically
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Extract individual frames
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", clip_path,
+                "-vf", f"fps={fps:.4f},scale={frame_width}:{frame_height}:force_original_aspect_ratio=decrease,pad={frame_width}:{frame_height}:(ow-iw)/2:(oh-ih)/2:color=black",
+                "-frames:v", str(num_frames),
+                "-q:v", "6",
+                os.path.join(tmp_dir, "frame_%03d.jpg"),
+            ],
+            capture_output=True,
+        )
+
+        frames = sorted(glob.glob(os.path.join(tmp_dir, "frame_*.jpg")))
+        if not frames:
+            return None
+
+        actual_frames = len(frames)
+
+        # Tile frames vertically into one sprite sheet
+        inputs = []
+        for f in frames:
+            inputs.extend(["-i", f])
+
+        if actual_frames == 1:
+            # Just copy the single frame
+            subprocess.run(["cp", frames[0], output_path], capture_output=True)
+        else:
+            filter_parts = []
+            for i in range(actual_frames):
+                filter_parts.append(f"[{i}]scale={frame_width}:{frame_height}[f{i}];")
+            vstack = "".join(f"[f{i}]" for i in range(actual_frames))
+            vstack += f"vstack=inputs={actual_frames}"
+            filter_str = "".join(filter_parts) + vstack
+
+            subprocess.run(
+                ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_str, "-q:v", "6", output_path],
+                capture_output=True,
+            )
+
+        if os.path.exists(output_path):
+            return {
+                "path": output_path,
+                "frame_count": actual_frames,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+            }
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -171,31 +236,61 @@ def find_clips(input_dir: str) -> list[str]:
 # Phase 1: Quick scan — generate HTML immediately
 # ---------------------------------------------------------------------------
 
-def quick_scan(clips: list[str]) -> list[dict]:
-    """Quick scan: just get durations and paths. No heavy processing."""
+def quick_scan(clips: list[str], output_dir: str) -> list[dict]:
+    """Quick scan: get durations, generate sprite sheets for instant scrubbing."""
     results = []
+    sprites_dir = os.path.join(output_dir, "sprites")
+    posters_dir = os.path.join(output_dir, "posters")
+    os.makedirs(sprites_dir, exist_ok=True)
+    os.makedirs(posters_dir, exist_ok=True)
+
     for i, clip_path in enumerate(clips, 1):
         clip_name = os.path.basename(clip_path)
-        print(f"  Scanning [{i}/{len(clips)}] {clip_name}", end="\r", flush=True)
+        clip_stem = Path(clip_path).stem
+        print(f"  [{i}/{len(clips)}] {clip_name}", end="", flush=True)
 
         try:
             info = get_clip_info(clip_path)
         except Exception:
             info = {"duration": 0, "size_bytes": 0, "width": 0, "height": 0}
 
-        results.append({
+        result = {
             "filename": clip_name,
             "path": os.path.abspath(clip_path),
             "duration": info["duration"],
             "size_bytes": info["size_bytes"],
             "width": info["width"],
             "height": info["height"],
-            "score": 0,  # 0 = not yet analysed
+            "score": 0,
             "audio_metrics": {},
             "poster": None,
-        })
+            "sprite": None,
+            "sprite_frames": 0,
+            "sprite_frame_width": 0,
+            "sprite_frame_height": 0,
+        }
 
-    print(f"  Scanned {len(clips)} clips.{' ' * 30}")
+        # Generate poster
+        poster_path = os.path.join(posters_dir, f"{clip_stem}.jpg")
+        extract_poster(clip_path, poster_path, info["duration"])
+        if os.path.exists(poster_path):
+            result["poster"] = os.path.relpath(poster_path, output_dir)
+
+        # Generate sprite sheet
+        sprite_path = os.path.join(sprites_dir, f"{clip_stem}.jpg")
+        sprite_info = generate_sprite_sheet(clip_path, sprite_path, info["duration"])
+        if sprite_info:
+            result["sprite"] = os.path.relpath(sprite_info["path"], output_dir)
+            result["sprite_frames"] = sprite_info["frame_count"]
+            result["sprite_frame_width"] = sprite_info["frame_width"]
+            result["sprite_frame_height"] = sprite_info["frame_height"]
+            print(f"  ✓ {info['duration']:.1f}s")
+        else:
+            print(f"  ✓")
+
+        results.append(result)
+
+    print(f"\n  Scanned {len(clips)} clips with sprite sheets.")
     return results
 
 
@@ -220,14 +315,6 @@ def run_triage(clips: list[dict], output_dir: str):
                 clip["score"] = score_excitement(metrics)
             else:
                 clip["score"] = 1
-
-        # Extract poster frame
-        poster_dir = os.path.join(output_dir, "posters")
-        os.makedirs(poster_dir, exist_ok=True)
-        poster_path = os.path.join(poster_dir, f"{Path(clip_name).stem}.jpg")
-        extract_poster(clip["path"], poster_path, clip["duration"])
-        if os.path.exists(poster_path):
-            clip["poster"] = os.path.relpath(poster_path, output_dir)
 
         stars = "★" * clip["score"] + "☆" * (5 - clip["score"])
         print(f"  →  {stars}")
@@ -286,12 +373,15 @@ def generate_report(clips: list[dict], output_dir: str, input_dir: str) -> str:
     .clip:hover {{ transform: scale(1.01); }}
     .clip.hidden {{ display: none; }}
 
-    /* Video container with hover scrub */
+    /* Video container with sprite scrub */
     .vid-wrap {{ position: relative; width: 100%; aspect-ratio: 16/9; background: #000; cursor: crosshair; overflow: hidden; }}
-    .vid-wrap video {{ width: 100%; height: 100%; object-fit: cover; pointer-events: none; }}
-    .vid-wrap img.poster {{ width: 100%; height: 100%; object-fit: cover; position: absolute; top: 0; left: 0; }}
-    .scrub-bar {{ position: absolute; bottom: 0; left: 0; height: 3px; background: #3b82f6; transition: width 0.05s; pointer-events: none; }}
-    .time-indicator {{ position: absolute; bottom: 8px; right: 8px; background: #000a; color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 4px; pointer-events: none; opacity: 0; transition: opacity 0.15s; font-variant-numeric: tabular-nums; }}
+    .vid-wrap video {{ width: 100%; height: 100%; object-fit: cover; }}
+    .vid-wrap img.poster {{ width: 100%; height: 100%; object-fit: cover; position: absolute; top: 0; left: 0; transition: opacity 0.1s; }}
+    .sprite-layer {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-size: 100% auto; background-repeat: no-repeat; opacity: 0; pointer-events: none; }}
+    .vid-wrap:hover .sprite-layer {{ opacity: 1; }}
+    .vid-wrap:hover .poster {{ opacity: 0; }}
+    .scrub-bar {{ position: absolute; bottom: 0; left: 0; height: 3px; background: #3b82f6; pointer-events: none; z-index: 2; }}
+    .time-indicator {{ position: absolute; bottom: 8px; right: 8px; background: #000a; color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 4px; pointer-events: none; opacity: 0; transition: opacity 0.15s; font-variant-numeric: tabular-nums; z-index: 2; }}
     .vid-wrap:hover .time-indicator {{ opacity: 1; }}
 
     /* Triage badge */
@@ -439,10 +529,15 @@ function renderClips() {{
         const triageLabel = clip.score === 0 ? '<span class="triage-status">⏳ pending</span>' : '<span class="triage-status done"></span>';
         const posterSrc = clip.poster ? clip.poster : '';
         const posterImg = posterSrc ? `<img class="poster" src="${{posterSrc}}" alt="">` : '';
+        const spriteSrc = clip.sprite ? clip.sprite : '';
+        const spriteFrames = clip.sprite_frames || 0;
+        const spriteFrameH = clip.sprite_frame_height || 180;
 
         card.innerHTML = `
-            <div class="vid-wrap" data-path="${{clip.path}}" data-duration="${{clip.duration}}">
+            <div class="vid-wrap" data-path="${{clip.path}}" data-duration="${{clip.duration}}"
+                 data-sprite="${{spriteSrc}}" data-sprite-frames="${{spriteFrames}}" data-sprite-frame-h="${{spriteFrameH}}">
                 ${{posterImg}}
+                <div class="sprite-layer"></div>
                 <div class="scrub-bar"></div>
                 <div class="time-indicator">0:00</div>
                 ${{triageLabel}}
@@ -496,76 +591,80 @@ function updateStats() {{
 }}
 
 // ---------------------------------------------------------------------------
-// Hover scrub
+// Hover scrub (sprite-sheet based — instant, no video decoding)
 // ---------------------------------------------------------------------------
 function attachScrubEvents() {{
     document.querySelectorAll('.vid-wrap').forEach(wrap => {{
-        let video = null;
-        let isLoaded = false;
+        const spriteSrc = wrap.dataset.sprite;
+        const spriteFrames = parseInt(wrap.dataset.spriteFrames) || 0;
+        const spriteFrameH = parseInt(wrap.dataset.spriteFrameH) || 180;
+        const spriteLayer = wrap.querySelector('.sprite-layer');
+        let spriteLoaded = false;
 
-        wrap.addEventListener('mouseenter', () => {{
-            if (wrap.closest('.expanded')) return;
-            if (!video) {{
-                video = document.createElement('video');
-                video.src = 'file://' + wrap.dataset.path;
-                video.muted = true;
-                video.preload = 'auto';
-                video.playsInline = true;
-                video.style.cssText = 'width:100%;height:100%;object-fit:cover;pointer-events:none;';
-                wrap.insertBefore(video, wrap.firstChild);
+        if (spriteSrc && spriteFrames > 0) {{
+            // Preload sprite on hover
+            wrap.addEventListener('mouseenter', () => {{
+                if (wrap.closest('.expanded')) return;
+                if (!spriteLoaded) {{
+                    spriteLayer.style.backgroundImage = `url(${{spriteSrc}})`;
+                    // Total sprite height = frames * frame_height
+                    // background-size: 100% (totalHeight / wrapHeight * 100)%
+                    spriteLayer.style.backgroundSize = `100% ${{spriteFrames * 100}}%`;
+                    spriteLoaded = true;
+                }}
+            }});
 
-                video.addEventListener('loadeddata', () => {{
-                    isLoaded = true;
-                    const poster = wrap.querySelector('.poster');
-                    if (poster) poster.style.opacity = '0';
-                }});
-            }}
-        }});
+            wrap.addEventListener('mousemove', (e) => {{
+                if (wrap.closest('.expanded')) return;
+                const rect = wrap.getBoundingClientRect();
+                const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                const duration = parseFloat(wrap.dataset.duration) || 0;
+                const time = pct * duration;
 
-        wrap.addEventListener('mousemove', (e) => {{
-            if (!video || !isLoaded || wrap.closest('.expanded')) return;
-            const rect = wrap.getBoundingClientRect();
-            const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            const duration = parseFloat(wrap.dataset.duration) || 0;
-            const time = pct * duration;
+                // Pick frame index
+                const frameIdx = Math.min(Math.floor(pct * spriteFrames), spriteFrames - 1);
 
-            video.currentTime = time;
+                // Offset: each frame is 1/spriteFrames of the total height
+                // background-position-y as percentage
+                const yPct = spriteFrames > 1 ? (frameIdx / (spriteFrames - 1)) * 100 : 0;
+                spriteLayer.style.backgroundPosition = `0 ${{yPct}}%`;
+                spriteLayer.style.opacity = '1';
 
-            // Update scrub bar
-            wrap.querySelector('.scrub-bar').style.width = (pct * 100) + '%';
+                // Scrub bar
+                wrap.querySelector('.scrub-bar').style.width = (pct * 100) + '%';
 
-            // Update time indicator
-            const mins = Math.floor(time / 60);
-            const secs = Math.floor(time % 60);
-            wrap.querySelector('.time-indicator').textContent = `${{mins}}:${{String(secs).padStart(2, '0')}}`;
-        }});
+                // Time indicator
+                const mins = Math.floor(time / 60);
+                const secs = Math.floor(time % 60);
+                wrap.querySelector('.time-indicator').textContent = `${{mins}}:${{String(secs).padStart(2, '0')}}`;
+            }});
 
-        wrap.addEventListener('mouseleave', () => {{
-            if (wrap.closest('.expanded')) return;
-            wrap.querySelector('.scrub-bar').style.width = '0';
-            const poster = wrap.querySelector('.poster');
-            if (poster) poster.style.opacity = '1';
-        }});
+            wrap.addEventListener('mouseleave', () => {{
+                if (wrap.closest('.expanded')) return;
+                wrap.querySelector('.scrub-bar').style.width = '0';
+                spriteLayer.style.opacity = '0';
+            }});
+        }}
 
-        // Double-click to expand and play with controls
+        // Double-click to expand and play with full video
         wrap.addEventListener('dblclick', () => {{
             const card = wrap.closest('.clip');
+            let video = wrap.querySelector('video');
+
             if (card.classList.contains('expanded')) {{
                 card.classList.remove('expanded');
                 if (video) {{
-                    video.controls = false;
-                    video.muted = true;
                     video.pause();
-                    video.style.pointerEvents = 'none';
+                    video.remove();
                 }}
             }} else {{
                 card.classList.add('expanded');
-                if (video) {{
-                    video.controls = true;
-                    video.muted = false;
-                    video.style.pointerEvents = 'auto';
-                    video.play();
-                }}
+                video = document.createElement('video');
+                video.src = 'file://' + wrap.dataset.path;
+                video.controls = true;
+                video.autoplay = true;
+                video.style.cssText = 'width:100%;height:100%;object-fit:contain;position:relative;z-index:3;';
+                wrap.appendChild(video);
             }}
         }});
     }});
@@ -753,9 +852,9 @@ def main():
         print("No video clips found. Supported formats: " + ", ".join(sorted(SUPPORTED_EXTENSIONS)))
         sys.exit(1)
 
-    # Phase 1: Quick scan
-    print(f"Phase 1: Scanning {len(clips)} clips...")
-    results = quick_scan(clips)
+    # Phase 1: Quick scan + sprite sheets
+    print(f"Phase 1: Scanning {len(clips)} clips + generating sprite sheets...")
+    results = quick_scan(clips, output_dir)
 
     # Generate report immediately (browsable before triage finishes)
     print(f"\nGenerating report...")
