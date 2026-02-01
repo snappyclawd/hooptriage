@@ -26,8 +26,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".mts", ".webm"}
-SCRUB_FRAMES = 24  # Number of frames in sprite sheet
-SPRITE_FRAME_HEIGHT = 135  # Height per frame in sprite sheet (240px wide, 16:9)
+SCRUB_FRAMES = 12  # Frames in sprite sheet (plenty for 5-30s clips)
+SPRITE_FRAME_W = 240  # Small and fast
+SPRITE_FRAME_H = 135  # 16:9
 
 
 # ---------------------------------------------------------------------------
@@ -101,63 +102,39 @@ def extract_poster(clip_path: str, output_path: str, duration: float):
 
 
 def generate_sprite_sheet(clip_path: str, output_path: str, duration: float, num_frames: int = SCRUB_FRAMES) -> dict | None:
-    """Generate a vertical sprite sheet of evenly-spaced frames for hover scrubbing."""
+    """Generate a horizontal sprite sheet in a single ffmpeg call. Should take ~1s per clip."""
     if duration <= 0:
         return None
 
-    frame_width = 320
-    frame_height = 180  # 16:9 aspect
+    # Single-pass: extract frames at interval, scale small, tile horizontally
+    # All in one ffmpeg call — no temp files, no multi-pass
+    fps = max(num_frames / duration, 0.5)
 
-    fps = num_frames / duration
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", clip_path,
+            "-vf", (
+                f"fps={fps:.4f},"
+                f"scale={SPRITE_FRAME_W}:{SPRITE_FRAME_H}:force_original_aspect_ratio=decrease,"
+                f"pad={SPRITE_FRAME_W}:{SPRITE_FRAME_H}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"tile={num_frames}x1"
+            ),
+            "-frames:v", "1",
+            "-q:v", "7",
+            output_path,
+        ],
+        capture_output=True,
+    )
 
-    # Extract individual frames then tile them vertically
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Extract individual frames
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", clip_path,
-                "-vf", f"fps={fps:.4f},scale={frame_width}:{frame_height}:force_original_aspect_ratio=decrease,pad={frame_width}:{frame_height}:(ow-iw)/2:(oh-ih)/2:color=black",
-                "-frames:v", str(num_frames),
-                "-q:v", "6",
-                os.path.join(tmp_dir, "frame_%03d.jpg"),
-            ],
-            capture_output=True,
-        )
-
-        frames = sorted(glob.glob(os.path.join(tmp_dir, "frame_*.jpg")))
-        if not frames:
-            return None
-
-        actual_frames = len(frames)
-
-        # Tile frames vertically into one sprite sheet
-        inputs = []
-        for f in frames:
-            inputs.extend(["-i", f])
-
-        if actual_frames == 1:
-            # Just copy the single frame
-            subprocess.run(["cp", frames[0], output_path], capture_output=True)
-        else:
-            filter_parts = []
-            for i in range(actual_frames):
-                filter_parts.append(f"[{i}]scale={frame_width}:{frame_height}[f{i}];")
-            vstack = "".join(f"[f{i}]" for i in range(actual_frames))
-            vstack += f"vstack=inputs={actual_frames}"
-            filter_str = "".join(filter_parts) + vstack
-
-            subprocess.run(
-                ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_str, "-q:v", "6", output_path],
-                capture_output=True,
-            )
-
-        if os.path.exists(output_path):
-            return {
-                "path": output_path,
-                "frame_count": actual_frames,
-                "frame_width": frame_width,
-                "frame_height": frame_height,
-            }
+    if result.returncode == 0 and os.path.exists(output_path):
+        # Count actual frames (tile pads with black if fewer frames available)
+        actual_frames = min(num_frames, max(1, int(duration * fps)))
+        return {
+            "path": output_path,
+            "frame_count": actual_frames,
+            "frame_width": SPRITE_FRAME_W,
+            "frame_height": SPRITE_FRAME_H,
+        }
 
     return None
 
@@ -377,7 +354,7 @@ def generate_report(clips: list[dict], output_dir: str, input_dir: str) -> str:
     .vid-wrap {{ position: relative; width: 100%; aspect-ratio: 16/9; background: #000; cursor: crosshair; overflow: hidden; }}
     .vid-wrap video {{ width: 100%; height: 100%; object-fit: cover; }}
     .vid-wrap img.poster {{ width: 100%; height: 100%; object-fit: cover; position: absolute; top: 0; left: 0; transition: opacity 0.1s; }}
-    .sprite-layer {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-size: 100% auto; background-repeat: no-repeat; opacity: 0; pointer-events: none; }}
+    .sprite-layer {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-size: auto 100%; background-repeat: no-repeat; opacity: 0; pointer-events: none; }}
     .vid-wrap:hover .sprite-layer {{ opacity: 1; }}
     .vid-wrap:hover .poster {{ opacity: 0; }}
     .scrub-bar {{ position: absolute; bottom: 0; left: 0; height: 3px; background: #3b82f6; pointer-events: none; z-index: 2; }}
@@ -607,9 +584,9 @@ function attachScrubEvents() {{
                 if (wrap.closest('.expanded')) return;
                 if (!spriteLoaded) {{
                     spriteLayer.style.backgroundImage = `url(${{spriteSrc}})`;
-                    // Total sprite height = frames * frame_height
-                    // background-size: 100% (totalHeight / wrapHeight * 100)%
-                    spriteLayer.style.backgroundSize = `100% ${{spriteFrames * 100}}%`;
+                    // Horizontal sprite: total width = frames * frame_width
+                    // Scale so height fills the container
+                    spriteLayer.style.backgroundSize = `${{spriteFrames * 100}}% 100%`;
                     spriteLoaded = true;
                 }}
             }});
@@ -624,10 +601,9 @@ function attachScrubEvents() {{
                 // Pick frame index
                 const frameIdx = Math.min(Math.floor(pct * spriteFrames), spriteFrames - 1);
 
-                // Offset: each frame is 1/spriteFrames of the total height
-                // background-position-y as percentage
-                const yPct = spriteFrames > 1 ? (frameIdx / (spriteFrames - 1)) * 100 : 0;
-                spriteLayer.style.backgroundPosition = `0 ${{yPct}}%`;
+                // Horizontal offset
+                const xPct = spriteFrames > 1 ? (frameIdx / (spriteFrames - 1)) * 100 : 0;
+                spriteLayer.style.backgroundPosition = `${{xPct}}% 0`;
                 spriteLayer.style.opacity = '1';
 
                 // Scrub bar
